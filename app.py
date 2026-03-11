@@ -2,7 +2,6 @@ import streamlit as st
 import anthropic
 from collections import defaultdict
 import re
-import io
 
 # ─── Configuração da página ───────────────────────────────────────────────────
 st.set_page_config(
@@ -11,8 +10,9 @@ st.set_page_config(
     layout="wide"
 )
 
-# ─── Mapeamento de etapas e colunas do CSV ────────────────────────────────────
-ETAPAS = [
+# ─── Colunas padrão (fallback se não detectar automaticamente) ────────────────
+# Formato original: ORDEM na col 0, etapas a partir da col 13, grupos de 7
+ETAPAS_PADRAO = [
     ("Pesagem",                  13, 14, 15, 18),
     ("Manipulação de Sólidos",   20, 21, 22, 25),
     ("Mistura Final",            27, 28, 29, 32),
@@ -90,7 +90,133 @@ def parse_valor(val):
     except:
         return 0.0
 
+def detectar_separador(content):
+    """Detecta automaticamente se o separador é ; ou ,"""
+    for line in content.split('\n')[:15]:
+        sc = line.count(';')
+        co = line.count(',')
+        if sc > 3 or co > 3:
+            return ';' if sc >= co else ','
+    return ';'
+
+def encontrar_col_idx(col_map, *keywords, default=None):
+    """
+    Encontra o índice de coluna procurando substrings nos nomes dos cabeçalhos.
+    Usa a PRIMEIRA ocorrência de cada match (importante para colunas com nomes repetidos).
+    """
+    for kw in keywords:
+        kw_up = kw.upper()
+        # Busca exata primeiro
+        if kw_up in col_map:
+            return col_map[kw_up]
+        # Busca parcial
+        for cn, idx in col_map.items():
+            if kw_up in cn:
+                return idx
+    return default
+
+def detectar_etapas_por_super_header(header_parts, super_header_parts):
+    """
+    Detecta etapas usando o super-header (linha acima do header de colunas).
+    Procura por colunas EQUIPAMENTO e associa cada uma a um nome de etapa
+    que aparece no super-header na mesma posição.
+    Retorna lista de (nome, c_equip, c_espera, c_processo, c_desvio).
+    """
+    equip_cols = [
+        i for i, h in enumerate(header_parts)
+        if 'EQUIPAMENTO' in h.strip().upper() or 'EQUIP' in h.strip().upper()
+    ]
+    if not equip_cols:
+        return None
+
+    etapas = []
+    for eq_col in equip_cols:
+        # Procurar nome da etapa no super-header ao redor de eq_col
+        nome_etapa = ''
+        for offset in range(-3, 4):
+            idx = eq_col + offset
+            if 0 <= idx < len(super_header_parts) and super_header_parts[idx].strip():
+                raw = super_header_parts[idx].strip()
+                # Limpar prefixos comuns nos super-headers de relatórios SAP/ERP
+                for prefix in [
+                    'DESVIO DE LEAD TIME/', 'LEAD TIME/', 'LT/',
+                    'TEMPO DE CICLO/', 'CICLO/', 'ETAPA/',
+                ]:
+                    raw = raw.replace(prefix, '').replace(prefix.upper(), '')
+                nome_etapa = raw.strip()
+                break
+
+        if not nome_etapa:
+            nome_etapa = f"Etapa {len(etapas) + 1}"
+
+        # Estrutura padrão por grupo: EQUIP(+0), ESPERA(+1), PROCESSO(+2), DESVIO(+5)
+        etapas.append((
+            nome_etapa,
+            eq_col,
+            eq_col + 1,
+            eq_col + 2,
+            eq_col + 5,
+        ))
+
+    return etapas if etapas else None
+
+
+def detectar_etapas_por_header(header_parts):
+    """
+    Fallback: tenta detectar etapas pelos nomes no próprio header de colunas,
+    procurando keywords de etapas farmacêuticas conhecidas.
+    """
+    ETAPAS_KEYWORDS = {
+        "Pesagem":                ["PESAGEM", "WEIGH"],
+        "Manipulação de Sólidos": ["SOLIDO", "SÓLIDO", "SOLID", "MANIPUL"],
+        "Mistura Final":          ["MISTURA", "MIXING", "BLEND"],
+        "Compressão":             ["COMPRESS"],
+        "Encapsulamento":         ["ENCAPSUL", "CAPSUL"],
+        "Revestimento":           ["REVESTIM", "COATING"],
+        "Emblistagem":            ["EMBLIST", "BLIST"],
+        "Linha 5":                ["LINHA 5", "LINE 5", "LN5"],
+        "Bulk":                   ["BULK"],
+    }
+    h_upper = [h.strip().upper() for h in header_parts]
+    etapas_detectadas = []
+
+    for nome_etapa, keywords in ETAPAS_KEYWORDS.items():
+        cols_etapa = []
+        for i, h in enumerate(h_upper):
+            for kw in keywords:
+                if kw in h:
+                    cols_etapa.append(i)
+                    break
+        if len(cols_etapa) < 4:
+            continue
+        sorted_cols = sorted(cols_etapa)
+        c_eq = c_esp = c_proc = c_desv = None
+        for ci in sorted_cols:
+            h = h_upper[ci]
+            if any(kw in h for kw in ["EQUIP", "RECURSO", "MAQUINA", "MÁQUINA"]):
+                c_eq = ci
+            elif any(kw in h for kw in ["ESPERA", "WAIT", "FILA"]):
+                c_esp = ci
+            elif any(kw in h for kw in ["PROCESS", "EXECU", "PRODUT"]):
+                c_proc = ci
+            elif any(kw in h for kw in ["DESVIO", "DEVIA", "VARIA"]):
+                c_desv = ci
+        if c_eq   is None: c_eq   = sorted_cols[0]
+        if c_esp  is None: c_esp  = sorted_cols[1] if len(sorted_cols) > 1 else sorted_cols[0]
+        if c_proc is None: c_proc = sorted_cols[2] if len(sorted_cols) > 2 else sorted_cols[0]
+        if c_desv is None: c_desv = sorted_cols[-1]
+        etapas_detectadas.append((nome_etapa, c_eq, c_esp, c_proc, c_desv))
+
+    return etapas_detectadas if len(etapas_detectadas) >= 3 else None
+
+
 def parse_csv(file_bytes):
+    """
+    Retorna (ordens, col_map, etapas, info_deteccao, erro).
+    Suporta dois formatos:
+      - Formato A: ORDEM na col 0, sem super-header, etapas a partir col 13
+      - Formato B: LOTE na col 0, super-header com nomes de etapas, colunas flexíveis
+    """
     content = None
     for encoding in ['utf-8-sig', 'latin-1', 'cp1252', 'utf-8']:
         try:
@@ -99,49 +225,149 @@ def parse_csv(file_bytes):
         except:
             continue
     if content is None:
-        return None, "Não foi possível ler o arquivo."
+        return None, None, None, {}, "Não foi possível ler o arquivo. Verifique o encoding."
+
+    sep = detectar_separador(content)
     lines = content.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+
+    # ── Detectar linha de cabeçalho (flexível: aceita ORDEM ou LOTE) ──────────
     header_idx = None
     for i, line in enumerate(lines):
-        if 'ORDEM' in line and 'LOTE' in line and 'SKU' in line:
+        lu = line.upper()
+        # Identificador de lote/ordem: LOTE, ORDEM, ORDER, BATCH
+        has_identif = ('LOTE' in lu or 'ORDEM' in lu or
+                       'ORDER' in lu or 'BATCH' in lu)
+        # Produto/material obrigatório
+        has_produto = ('SKU' in lu or 'PRODUTO' in lu or
+                       'MATERIAL' in lu or 'DESCRI' in lu)
+        if has_identif and has_produto:
             header_idx = i
             break
+
     if header_idx is None:
-        return None, "Formato não reconhecido. Use o Relatório de Lead Time de Ordem (Analítico) em CSV."
+        return None, None, None, {}, (
+            "Formato não reconhecido. O cabeçalho deve conter colunas de LOTE/ORDEM e SKU/PRODUTO."
+        )
+
+    header_parts = lines[header_idx].rstrip(sep).split(sep)
+
+    # ── Construir col_map preservando PRIMEIRA ocorrência (evita sobrescrever) ─
+    col_map = {}
+    for i, h in enumerate(header_parts):
+        key = h.strip().upper()
+        if key and key not in col_map:
+            col_map[key] = i
+
+    # ── Detectar super-header (linha antes do header com nomes de etapas) ──────
+    super_header_parts = None
+    if header_idx > 0:
+        prev = lines[header_idx - 1].split(sep)
+        non_empty = [v.strip() for v in prev if v.strip()]
+        # Super-header legítimo: múltiplas células com "/" (padrão de relatórios ERP)
+        slash_count = sum(1 for v in non_empty if '/' in v)
+        if slash_count >= 2 or len(non_empty) >= 4:
+            super_header_parts = prev
+
+    # ── Detectar etapas (3 métodos em cascata) ───────────────────────────────
+    modo_etapas = "padrão (fallback)"
+    etapas = None
+
+    if super_header_parts is not None:
+        etapas = detectar_etapas_por_super_header(header_parts, super_header_parts)
+        if etapas:
+            modo_etapas = f"super-header ({len(etapas)} etapas detectadas)"
+
+    if etapas is None:
+        etapas = detectar_etapas_por_header(header_parts)
+        if etapas:
+            modo_etapas = f"keywords no header ({len(etapas)} etapas)"
+
+    if etapas is None:
+        etapas = ETAPAS_PADRAO
+        modo_etapas = "padrão fixo (fallback — colunas originais)"
+
+    # ── Parse das linhas de dados ─────────────────────────────────────────────
     ordens = []
     for line in lines[header_idx + 1:]:
         if not line.strip():
             continue
-        partes = line.rstrip(';').split(';')
-        if len(partes) < 12 or not partes[0].strip().isdigit():
+        partes = line.rstrip(sep).split(sep)
+        if len(partes) < 5:
             continue
-        while len(partes) < 75:
+        # Aceita identificadores numéricos e alfanuméricos (OP-1234, 26010499, etc.)
+        first_val = partes[0].strip()
+        if not first_val or not re.match(r'^[A-Z0-9]', first_val.upper()):
+            continue
+        min_cols = max(125, len(header_parts))
+        while len(partes) < min_cols:
             partes.append('')
         ordens.append(partes)
-    if not ordens:
-        return None, "Nenhuma ordem encontrada no arquivo."
-    return ordens, None
 
-def extrair_dados(ordens):
+    if not ordens:
+        return None, None, None, {}, (
+            f"Nenhuma ordem encontrada. Separador detectado: '{sep}'. "
+            "Verifique se o arquivo tem linhas de dados após o cabeçalho."
+        )
+
+    info = {
+        "separador": sep,
+        "header_linha": header_idx,
+        "total_colunas": len(header_parts),
+        "modo_etapas": modo_etapas,
+        "etapas": etapas,
+        "col_map_sample": dict(list(col_map.items())[:25]),
+    }
+    return ordens, col_map, etapas, info, None
+
+
+def extrair_dados(ordens, col_map, etapas):
+    """Extrai dados usando col_map para campos básicos e etapas para rotas."""
+
+    # Detectar colunas básicas com fallbacks para ambos os formatos
+    c_ordem   = encontrar_col_idx(col_map,
+                    'LOTE', 'ORDEM', 'ORDER', 'BATCH', default=0)
+    c_sku     = encontrar_col_idx(col_map,
+                    'SKU', 'CÓD. MATERIAL', 'COD. MATERIAL', 'MATERIAL', default=1)
+    c_produto = encontrar_col_idx(col_map,
+                    'PRODUTO', 'DESCRI', 'PRODUCT', 'NOME', default=2)
+    c_lt_real = encontrar_col_idx(col_map,
+                    'LEAD TIME TOTAL REAL', 'LT TOTAL REAL', 'LEAD TIME REAL', 'LT REAL', default=6)
+    c_lt_pad  = encontrar_col_idx(col_map,
+                    'LEAD TIME PADRÃO', 'LEAD TIME PADRAO', 'LT PADRÃO', 'LT PADRAO',
+                    'LT PADR', 'LT STAND', default=7)
+    c_desvio  = encontrar_col_idx(col_map,
+                    'DESVIO DE LEAD TIME', 'DESVIO TOTAL', 'DESVIO', default=8)
+    c_espera  = encontrar_col_idx(col_map,
+                    'ESPERA TOTAL REAL', 'ESPERA TOTAL', 'TOTAL ESPERA', default=9)
+    c_proc    = encontrar_col_idx(col_map,
+                    'PROCESSO TOTAL REAL', 'PROCESSO TOTAL', 'PROCESS TOTAL', default=10)
+
+    def get(row, idx, fallback=''):
+        if idx is None or idx >= len(row):
+            return fallback
+        return row[idx].strip()
+
     produtos = defaultdict(list)
     for row in ordens:
-        ordem   = row[0].strip()
-        sku     = row[2].strip()
-        produto = row[3].strip()
-        lt_real   = parse_valor(row[7])
-        lt_padrao = parse_valor(row[8])
-        desvio    = parse_valor(row[9])
-        espera_t  = parse_valor(row[10])
-        proc_t    = parse_valor(row[11])
+        ordem   = get(row, c_ordem)
+        sku     = get(row, c_sku)
+        produto = get(row, c_produto)
+        lt_real   = parse_valor(get(row, c_lt_real,   '0'))
+        lt_padrao = parse_valor(get(row, c_lt_pad,    '0'))
+        desvio    = parse_valor(get(row, c_desvio,    '0'))
+        espera_t  = parse_valor(get(row, c_espera,    '0'))
+        proc_t    = parse_valor(get(row, c_proc,      '0'))
+
         rota = []
-        for nome_etapa, c_eq, c_esp, c_proc, c_desv in ETAPAS:
-            equip = row[c_eq].strip() if c_eq < len(row) else ''
-            esp   = parse_valor(row[c_esp])  if c_esp  < len(row) else 0.0
-            proc  = parse_valor(row[c_proc]) if c_proc < len(row) else 0.0
-            desv  = parse_valor(row[c_desv]) if c_desv < len(row) else 0.0
+        for nome_etapa, c_eq, c_esp, c_prc, c_dsv in etapas:
+            equip = get(row, c_eq)
+            esp   = parse_valor(get(row, c_esp,  '0'))
+            proc  = parse_valor(get(row, c_prc,  '0'))
+            desv  = parse_valor(get(row, c_dsv,  '0'))
             if equip:
                 rota.append({'etapa': nome_etapa, 'equipamento': equip,
                              'espera': esp, 'processo': proc, 'desvio': desv})
+
         chave = f"{sku} — {produto}"
         produtos[chave].append({
             'ordem': ordem, 'lt_real': lt_real, 'lt_padrao': lt_padrao,
@@ -181,12 +407,8 @@ def formatar_resumo(produtos):
                 linhas.append(f"  -> {nome} ({equips}): desvio médio {avg_dev:.2f}d | máx {max_dev:.2f}d | espera média {avg_esp:.2f}d")
         piores   = sorted(ordens, key=lambda x: x['desvio'], reverse=True)[:3]
         melhores = sorted(ordens, key=lambda x: x['desvio'])[:3]
-        desvios_piores   = ', '.join(str(round(o['desvio'], 1)) + 'd' for o in piores)
-        desvios_melhores = ', '.join(str(round(o['desvio'], 1)) + 'd' for o in melhores)
-        ordens_piores    = ', '.join(o['ordem'] for o in piores)
-        ordens_melhores  = ', '.join(o['ordem'] for o in melhores)
-        linhas.append(f"  [!] Piores: ordens {ordens_piores} (desvios: {desvios_piores})")
-        linhas.append(f"  [OK] Melhores: ordens {ordens_melhores} (desvios: {desvios_melhores})")
+        linhas.append(f"  [!] Piores: ordens {', '.join(o['ordem'] for o in piores)} (desvios: {', '.join(str(round(o['desvio'],1))+'d' for o in piores)})")
+        linhas.append(f"  [OK] Melhores: ordens {', '.join(o['ordem'] for o in melhores)} (desvios: {', '.join(str(round(o['desvio'],1))+'d' for o in melhores)})")
     return '\n'.join(linhas)
 
 def chamar_claude(system_prompt, messages, api_key):
@@ -201,8 +423,10 @@ def chamar_claude(system_prompt, messages, api_key):
 
 # ─── Funções de Export ────────────────────────────────────────────────────────
 def limpar_texto(texto):
-    """Remove emojis e caracteres fora do Latin-1 para compatibilidade com PDF"""
+    """Remove/substitui caracteres fora do Latin-1 para compatibilidade com PDF."""
     substituicoes = {
+        '—': ' - ', '–': '-',
+        '\u2019': "'", '\u2018': "'", '\u201c': '"', '\u201d': '"',
         '→': '->', '⚠': '[!]', '✓': '[v]', '✅': '[OK]',
         '🗺️': '', '🔴': '>>>', '📊': '', '📈': '', '🏭': '',
         '💬': '', '💡': '', '🔍': '', '⚙️': '', '🔄': '',
@@ -214,6 +438,11 @@ def limpar_texto(texto):
 
 def gerar_pdf(texto, titulo="Diagnostico de Fluxo Produtivo"):
     from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+
+    MARGIN_L, MARGIN_R, MARGIN_T = 15, 15, 22
+    CONTENT_W = 210 - MARGIN_L - MARGIN_R  # 180mm (A4)
+    INDENT = 5  # recuo para bullet points
 
     texto_limpo = limpar_texto(texto)
 
@@ -222,7 +451,8 @@ def gerar_pdf(texto, titulo="Diagnostico de Fluxo Produtivo"):
             self.set_fill_color(31, 78, 121)
             self.set_text_color(255, 255, 255)
             self.set_font('Helvetica', 'B', 13)
-            self.cell(0, 12, titulo, fill=True, new_x="LMARGIN", new_y="NEXT", align='C')
+            self.multi_cell(CONTENT_W, 12, titulo, fill=True,
+                            new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
             self.set_text_color(0, 0, 0)
             self.ln(3)
         def footer(self):
@@ -232,151 +462,55 @@ def gerar_pdf(texto, titulo="Diagnostico de Fluxo Produtivo"):
             self.cell(0, 10, f'Pagina {self.page_no()}', align='C')
 
     pdf = PDF()
-    pdf.set_margins(15, 22, 15)
+    pdf.set_margins(MARGIN_L, MARGIN_T, MARGIN_R)
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=20)
 
     for linha in texto_limpo.split('\n'):
         linha = linha.rstrip()
         if not linha:
-            pdf.ln(3)
-            continue
+            pdf.ln(3); continue
         if linha.startswith('## '):
             pdf.set_font('Helvetica', 'B', 12)
             pdf.set_fill_color(214, 228, 240)
             pdf.set_text_color(31, 78, 121)
-            pdf.cell(0, 8, linha[3:], fill=True, new_x="LMARGIN", new_y="NEXT")
-            pdf.set_text_color(0, 0, 0)
-            pdf.ln(2)
+            pdf.multi_cell(CONTENT_W, 8, linha[3:], fill=True,
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(0, 0, 0); pdf.ln(2)
         elif linha.startswith('### '):
             pdf.set_font('Helvetica', 'B', 11)
             pdf.set_text_color(46, 117, 182)
-            pdf.cell(0, 7, linha[4:], new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(CONTENT_W, 7, linha[4:],
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_text_color(0, 0, 0)
         elif linha.startswith('- ') or linha.startswith('* '):
             pdf.set_font('Helvetica', '', 10)
-            pdf.set_x(20)
-            pdf.multi_cell(0, 6, '- ' + linha[2:])
+            pdf.set_x(MARGIN_L + INDENT)
+            pdf.multi_cell(CONTENT_W - INDENT, 6, '- ' + linha[2:],
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         else:
             pdf.set_font('Helvetica', '', 10)
-            pdf.multi_cell(0, 6, linha)
+            pdf.multi_cell(CONTENT_W, 6, linha,
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     return bytes(pdf.output())
 
-def gerar_jpeg(texto, titulo="Diagnostico de Fluxo Produtivo"):
-    from PIL import Image, ImageDraw, ImageFont
-    import textwrap
-
-    texto_limpo = limpar_texto(texto)
-
-    LARGURA   = 1080
-    MARGEM    = 55
-    COR_AZUL  = (31, 78, 121)
-    COR_AZUL2 = (214, 228, 240)
-    COR_TEXT  = (51, 51, 51)
-    COR_CINZA = (160, 160, 160)
-
-    def fonte(tam, bold=False):
-        tentativas = (['arialbd.ttf', 'Arial Bold.ttf', 'DejaVuSans-Bold.ttf'] if bold
-                      else ['arial.ttf', 'Arial.ttf', 'DejaVuSans.ttf'])
-        for nome in tentativas:
-            try:
-                return ImageFont.truetype(nome, tam)
-            except:
-                continue
-        return ImageFont.load_default()
-
-    f_titulo = fonte(34, bold=True)
-    f_h2     = fonte(26, bold=True)
-    f_h3     = fonte(22, bold=True)
-    f_texto  = fonte(20)
-    f_footer = fonte(16)
-
-    itens = []
-    for linha in texto_limpo.split('\n'):
-        linha = linha.rstrip()
-        if not linha:
-            itens.append(('vazio', ''))
-        elif linha.startswith('## '):
-            itens.append(('h2', linha[3:]))
-        elif linha.startswith('### '):
-            itens.append(('h3', linha[4:]))
-        elif linha.startswith('- ') or linha.startswith('* '):
-            for w in textwrap.wrap('• ' + linha[2:], 72):
-                itens.append(('bullet', w))
-        else:
-            for w in (textwrap.wrap(linha, 72) or ['']):
-                itens.append(('texto', w))
-
-    alturas = {'vazio': 14, 'h2': 48, 'h3': 36, 'bullet': 28, 'texto': 28}
-    altura  = 90 + sum(alturas[t] for t, _ in itens) + 60
-    altura  = max(altura, 500)
-
-    img  = Image.new('RGB', (LARGURA, altura), 'white')
-    draw = ImageDraw.Draw(img)
-
-    draw.rectangle([0, 0, LARGURA, 72], fill=COR_AZUL)
-    draw.text((MARGEM, 16), titulo, font=f_titulo, fill='white')
-
-    y = 90
-    for tipo, conteudo in itens:
-        if tipo == 'vazio':
-            y += 14
-        elif tipo == 'h2':
-            draw.rectangle([MARGEM - 10, y - 4, LARGURA - MARGEM + 10, y + 40], fill=COR_AZUL2)
-            draw.text((MARGEM, y + 2), conteudo, font=f_h2, fill=COR_AZUL)
-            y += 48
-        elif tipo == 'h3':
-            draw.text((MARGEM, y), conteudo, font=f_h3, fill=(46, 117, 182))
-            y += 36
-        elif tipo == 'bullet':
-            draw.text((MARGEM + 14, y), conteudo, font=f_texto, fill=COR_TEXT)
-            y += 28
-        elif tipo == 'texto':
-            draw.text((MARGEM, y), conteudo, font=f_texto, fill=COR_TEXT)
-            y += 28
-
-    draw.rectangle([0, y + 10, LARGURA, y + 42], fill=(240, 240, 240))
-    draw.text((MARGEM, y + 18), "Agente de Otimizacao de Fluxo Produtivo", font=f_footer, fill=COR_CINZA)
-
-    img = img.crop((0, 0, LARGURA, y + 44))
-    buf = io.BytesIO()
-    img.save(buf, format='JPEG', quality=90)
-    return buf.getvalue()
-
 def botoes_export(texto, prefixo="diagnostico"):
-    """Renderiza botões de download PDF e JPEG lado a lado"""
-    col_pdf, col_jpg = st.columns(2)
-    with col_pdf:
-        try:
-            pdf_bytes = gerar_pdf(texto)
-            st.download_button(
-                label="📄 Baixar PDF",
-                data=pdf_bytes,
-                file_name=f"{prefixo}.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-        except Exception as e:
-            st.error(f"Erro ao gerar PDF: {e}")
-    with col_jpg:
-        try:
-            jpg_bytes = gerar_jpeg(texto)
-            st.download_button(
-                label="🖼️ Baixar JPEG (WhatsApp)",
-                data=jpg_bytes,
-                file_name=f"{prefixo}.jpg",
-                mime="image/jpeg",
-                use_container_width=True
-            )
-        except Exception as e:
-            st.error(f"Erro ao gerar JPEG: {e}")
+    try:
+        st.download_button(
+            label="📄 Baixar PDF",
+            data=gerar_pdf(texto),
+            file_name=f"{prefixo}.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+    except Exception as e:
+        st.error(f"Erro ao gerar PDF: {e}")
 
 # ─── Interface ────────────────────────────────────────────────────────────────
 st.title("🏭 Agente de Otimização de Fluxo Produtivo")
 st.caption("Carregue o Relatório de Lead Time (Analítico) e receba recomendações baseadas nas rotas históricas.")
 
-# Session state
 if 'resumo_dados'       not in st.session_state: st.session_state.resumo_dados       = None
 if 'historico_chat'     not in st.session_state: st.session_state.historico_chat     = []
 if 'ultimo_diagnostico' not in st.session_state: st.session_state.ultimo_diagnostico = None
@@ -387,7 +521,7 @@ with st.sidebar:
     st.markdown("[👉 Obter API Key](https://console.anthropic.com)")
     st.divider()
     st.markdown("**Formato esperado:**")
-    st.markdown("Relatório de Lead Time de Ordem (Analítico) — arquivo `.csv` separado por `;`.")
+    st.markdown("Relatório de Lead Time de Ordem/Lote (Analítico) — `.csv` separado por `;` ou `,`.")
     if st.session_state.resumo_dados:
         st.divider()
         st.success("✅ Dados carregados")
@@ -403,25 +537,50 @@ arquivo = st.file_uploader("Selecione o arquivo CSV", type=["csv"], label_visibi
 
 if arquivo:
     file_bytes = arquivo.read()
-    ordens, erro = parse_csv(file_bytes)
+    ordens, col_map, etapas, info, erro = parse_csv(file_bytes)
     if erro:
         st.error(f"❌ {erro}")
     else:
-        produtos = extrair_dados(ordens)
+        produtos = extrair_dados(ordens, col_map, etapas)
         total_ordens = sum(len(v) for v in produtos.values())
+
         col1, col2, col3 = st.columns(3)
         col1.metric("Ordens encontradas", total_ordens)
         col2.metric("SKUs distintos", len(produtos))
         todos_lts = [o['lt_real'] for ords in produtos.values() for o in ords if o['lt_real'] > 0]
         lt_medio = sum(todos_lts) / len(todos_lts) if todos_lts else 0
         col3.metric("Lead Time médio geral", f"{lt_medio:.1f} dias")
+
+        # Aviso se nenhuma rota foi detectada (etapas com problemas)
+        ordens_com_rota = sum(1 for ords in produtos.values() for o in ords if o['rota'])
+        if ordens_com_rota == 0 and total_ordens > 0:
+            st.warning(
+                "⚠️ **Dados de lead time carregados, mas nenhuma rota de etapas foi detectada.** "
+                "Abra a aba '🔧 Debug' abaixo para ver quais colunas foram encontradas."
+            )
+        else:
+            st.success(f"✅ {info.get('modo_etapas', '')} | {ordens_com_rota}/{total_ordens} ordens com rota")
+
         with st.expander("📋 Produtos encontrados"):
             for chave, ords in sorted(produtos.items()):
                 lts  = [o['lt_real'] for o in ords if o['lt_real'] > 0]
                 devs = [o['desvio']  for o in ords]
-                avg_lt = sum(lts) / len(lts)   if lts  else 0
-                avg_d  = sum(devs) / len(devs) if devs else 0
+                avg_lt = sum(lts)/len(lts)   if lts  else 0
+                avg_d  = sum(devs)/len(devs) if devs else 0
                 st.markdown(f"**{chave}** — {len(ords)} ordens | LT médio: {avg_lt:.1f}d | Desvio médio: {avg_d:.1f}d")
+
+        with st.expander("🔧 Debug — Colunas detectadas"):
+            st.markdown(f"**Separador:** `{info.get('separador')}`")
+            st.markdown(f"**Header na linha:** {info.get('header_linha')}")
+            st.markdown(f"**Total de colunas:** {info.get('total_colunas')}")
+            st.markdown(f"**Detecção de etapas:** {info.get('modo_etapas')}")
+            st.markdown("**Etapas mapeadas:**")
+            for e in etapas:
+                st.text(f"  {e[0]}: equip={e[1]}, espera={e[2]}, proc={e[3]}, desvio={e[4]}")
+            st.markdown("**Primeiras 20 colunas:**")
+            for nome, idx in sorted(info.get('col_map_sample', {}).items(), key=lambda x: x[1]):
+                st.text(f"  [{idx:3d}] {nome}")
+
         st.session_state.resumo_dados       = formatar_resumo(produtos)
         st.session_state.historico_chat     = []
         st.session_state.ultimo_diagnostico = None
@@ -433,7 +592,6 @@ if st.session_state.resumo_dados:
     if not api_key:
         st.warning("⚠️ Insira sua API Key na barra lateral para usar o agente.")
     else:
-        # ── Análise Geral ──────────────────────────────────────────────────────
         st.subheader("📊 2. Diagnóstico Completo")
         if st.button("🔍 Gerar Diagnóstico Completo", type="primary", use_container_width=True):
             with st.spinner("Analisando rotas e padrões históricos..."):
@@ -456,7 +614,6 @@ if st.session_state.resumo_dados:
 
         st.divider()
 
-        # ── Perguntas Específicas ──────────────────────────────────────────────
         st.subheader("💬 3. Perguntas Específicas")
         st.caption("Faça perguntas sobre produtos, metas de lead time, turnos, equipamentos ou qualquer cenário específico.")
 
@@ -476,7 +633,6 @@ if st.session_state.resumo_dados:
                     botoes_export(msg["content"], prefixo="resposta_agente")
 
         pergunta = st.chat_input("Faça sua pergunta sobre o fluxo produtivo...")
-
         if pergunta:
             with st.chat_message("user", avatar="🧑"):
                 st.markdown(pergunta)
@@ -508,9 +664,8 @@ Responda à pergunta do usuário com base nesses dados."""
                         st.error("❌ API Key inválida.")
                     except Exception as e:
                         st.error(f"❌ Erro: {str(e)}")
-
 else:
     st.info("👆 Carregue o arquivo CSV para habilitar o agente.")
 
 st.divider()
-st.caption("Beta v0.4 · Agente de Otimização de Fluxo Produtivo")
+st.caption("Beta v0.5 · Agente de Otimização de Fluxo Produtivo")
