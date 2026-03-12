@@ -738,30 +738,19 @@ Histórico completo da discussão:
             with st.chat_message("user", avatar="🧑"):
                 st.markdown(pergunta)
 
-            # Contexto principal: diagnóstico gerado (comprimido) + índice de SKUs e
-            # equipamentos extraído dos dados brutos (para matching de nomes parciais).
-            # Fallback para dados brutos truncados se o diagnóstico ainda não existe.
-            skus_ref = "\n".join(
-                linha for linha in st.session_state.resumo_dados.split('\n')
-                if linha.startswith('PRODUTO:') or linha.strip().startswith('->')
-            )
-            contexto_comprimido = (
-                st.session_state.ultimo_diagnostico
-                or st.session_state.resumo_dados[:6000]
-            )
-            contexto_inicial = f"""Você é um especialista em fluxo produtivo industrial. Abaixo está a análise dos dados de produção dos últimos 90 dias:
+            # Dados completos sempre presentes — são o que garante a inteligência do agente.
+            # O controle de TPM é feito limitando o histórico enviado (últimas 4 mensagens),
+            # não cortando os dados. Isso evita crescimento ilimitado de tokens por chamada.
+            contexto_inicial = f"""Você tem acesso ao seguinte histórico de produção dos últimos 90 dias:
 
-{contexto_comprimido}
+{st.session_state.resumo_dados}
 
 ---
-ÍNDICE DE PRODUTOS E EQUIPAMENTOS DA BASE (use para identificar o produto mencionado pelo usuário, mesmo que o nome seja parcial ou aproximado):
-{skus_ref}
+Responda à pergunta do usuário com base nesses dados. Respeite todas as restrições mencionadas na conversa."""
 
----
-Responda à pergunta do usuário com base nessa análise. Respeite todas as restrições mencionadas na conversa."""
-
-            # Limita o histórico às últimas 10 mensagens para controlar o uso de tokens
-            historico_recente = st.session_state.historico_chat[-10:]
+            # Últimas 4 mensagens do histórico (2 rodadas de Q&A) — controla TPM
+            # sem sacrificar a inteligência dos dados
+            historico_recente = st.session_state.historico_chat[-4:]
 
             messages_para_claude = [
                 {"role": "user",      "content": contexto_inicial},
