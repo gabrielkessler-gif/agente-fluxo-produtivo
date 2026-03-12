@@ -738,8 +738,13 @@ Histórico completo da discussão:
             with st.chat_message("user", avatar="🧑"):
                 st.markdown(pergunta)
 
-            # Usa o diagnóstico como contexto (muito menor que os dados brutos)
-            # com fallback para os dados truncados se o diagnóstico ainda não foi gerado
+            # Contexto principal: diagnóstico gerado (comprimido) + índice de SKUs e
+            # equipamentos extraído dos dados brutos (para matching de nomes parciais).
+            # Fallback para dados brutos truncados se o diagnóstico ainda não existe.
+            skus_ref = "\n".join(
+                linha for linha in st.session_state.resumo_dados.split('\n')
+                if linha.startswith('PRODUTO:') or linha.strip().startswith('->')
+            )
             contexto_comprimido = (
                 st.session_state.ultimo_diagnostico
                 or st.session_state.resumo_dados[:6000]
@@ -747,6 +752,10 @@ Histórico completo da discussão:
             contexto_inicial = f"""Você é um especialista em fluxo produtivo industrial. Abaixo está a análise dos dados de produção dos últimos 90 dias:
 
 {contexto_comprimido}
+
+---
+ÍNDICE DE PRODUTOS E EQUIPAMENTOS DA BASE (use para identificar o produto mencionado pelo usuário, mesmo que o nome seja parcial ou aproximado):
+{skus_ref}
 
 ---
 Responda à pergunta do usuário com base nessa análise. Respeite todas as restrições mencionadas na conversa."""
