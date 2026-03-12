@@ -738,26 +738,38 @@ Histórico completo da discussão:
             with st.chat_message("user", avatar="🧑"):
                 st.markdown(pergunta)
 
-            # Dados completos sempre presentes — são o que garante a inteligência do agente.
-            # O controle de TPM é feito limitando o histórico enviado (últimas 4 mensagens),
-            # não cortando os dados. Isso evita crescimento ilimitado de tokens por chamada.
+            # ── Contexto fixo: dados brutos completos ────────────────────────────
             contexto_inicial = f"""Você tem acesso ao seguinte histórico de produção dos últimos 90 dias:
 
 {st.session_state.resumo_dados}
 
 ---
-Responda à pergunta do usuário com base nesses dados. Respeite todas as restrições mencionadas na conversa."""
-
-            # Últimas 4 mensagens do histórico (2 rodadas de Q&A) — controla TPM
-            # sem sacrificar a inteligência dos dados
-            historico_recente = st.session_state.historico_chat[-4:]
+Responda sempre com base nesses dados e no diagnóstico já realizado. Respeite todas as restrições mencionadas na conversa."""
 
             messages_para_claude = [
                 {"role": "user",      "content": contexto_inicial},
-                {"role": "assistant", "content": "Entendido. Tenho a análise carregada e estou pronto para responder."},
+                {"role": "assistant", "content": "Entendido. Tenho os dados carregados."},
             ]
-            for msg in historico_recente:
+
+            # ── Diagnóstico sempre fixo (pinned) ─────────────────────────────────
+            # Fica separado do histórico rotativo para nunca ser descartado.
+            if st.session_state.ultimo_diagnostico:
+                messages_para_claude.append({
+                    "role": "user",
+                    "content": "Com base nesses dados, qual é o diagnóstico completo do fluxo produtivo?"
+                })
+                messages_para_claude.append({
+                    "role": "assistant",
+                    "content": st.session_state.ultimo_diagnostico
+                })
+
+            # ── Histórico rotativo: apenas rodadas de debate (sem o diagnóstico) ─
+            # historico_chat[2:] pula o par de seed do diagnóstico (índices 0 e 1).
+            # Limita a 6 mensagens (3 rodadas de Q&A) para controlar TPM.
+            debate_history = st.session_state.historico_chat[2:]
+            for msg in debate_history[-6:]:
                 messages_para_claude.append({"role": msg["role"], "content": msg["content"]})
+
             messages_para_claude.append({"role": "user", "content": pergunta})
 
             with st.chat_message("assistant", avatar="🤖"):
@@ -776,4 +788,4 @@ else:
     st.info("👆 Carregue o arquivo CSV para habilitar o agente.")
 
 st.divider()
-st.caption("Beta v0.5 · Agente de Otimização de Fluxo Produtivo")
+st.caption("Beta v0.6 · Agente de Otimização de Fluxo Produtivo")
