@@ -105,6 +105,35 @@ OBRIGATÓRIO: toda resposta deve terminar com uma conclusão direta. Siga estas 
 
 Seja direto, use os dados disponíveis e cite números reais do histórico."""
 
+SYSTEM_RELATORIO = """Você é um especialista em otimização de fluxo produtivo. Você recebe o histórico completo de uma discussão técnica entre o agente de análise e a equipe da fábrica.
+
+Sua tarefa é consolidar essa discussão em um relatório executivo profissional, estruturado nas seguintes seções:
+
+## Contexto da Análise
+Descreva brevemente o escopo analisado: período, quantidade de SKUs e ordens, unidade industrial.
+
+## Aprendizados da Discussão
+Liste os principais insights que emergiram do debate — pontos levantados pela equipe, questionamentos respondidos, nuances identificadas que não estavam no diagnóstico inicial.
+
+## Plano de Ação Consolidado
+Apresente o plano de ação final, incorporando os ajustes discutidos. Para cada ação, inclua:
+- Ação específica
+- Etapa/equipamento afetado
+- Impacto esperado (redução de lead time ou ganho de throughput)
+- Complexidade (baixa / média / alta)
+- Responsável sugerido
+
+## Decisões e Alinhamentos
+Registre decisões tomadas, pontos de concordância e discordâncias resolvidas durante a discussão.
+
+## Próximos Passos
+Liste as ações imediatas acordadas, com prazo sugerido e responsável.
+
+## Conclusão
+Síntese direta do resultado da discussão: o que foi validado, o que mudou em relação ao diagnóstico inicial, e qual o ganho potencial se o plano for executado.
+
+Use linguagem direta e objetiva. Cite números reais sempre que disponíveis. Este relatório será entregue à liderança da fábrica."""
+
 # ─── Funções de parse ─────────────────────────────────────────────────────────
 def parse_valor(val):
     if not val or str(val).strip() in ('', ' ', '-'):
@@ -538,6 +567,7 @@ st.caption("Carregue o Relatório de Lead Time (Analítico) e receba recomendaç
 if 'resumo_dados'       not in st.session_state: st.session_state.resumo_dados       = None
 if 'historico_chat'     not in st.session_state: st.session_state.historico_chat     = []
 if 'ultimo_diagnostico' not in st.session_state: st.session_state.ultimo_diagnostico = None
+if 'relatorio_debate'   not in st.session_state: st.session_state.relatorio_debate   = None
 
 with st.sidebar:
     st.header("⚙️ Configuração")
@@ -553,6 +583,7 @@ with st.sidebar:
             st.session_state.resumo_dados       = None
             st.session_state.historico_chat     = []
             st.session_state.ultimo_diagnostico = None
+            st.session_state.relatorio_debate   = None
             st.rerun()
 
 # ─── Seção 1: Upload ──────────────────────────────────────────────────────────
@@ -608,6 +639,7 @@ if arquivo:
         st.session_state.resumo_dados       = formatar_resumo(produtos)
         st.session_state.historico_chat     = []
         st.session_state.ultimo_diagnostico = None
+        st.session_state.relatorio_debate   = None
 
 st.divider()
 
@@ -626,6 +658,10 @@ if st.session_state.resumo_dados:
                         api_key
                     )
                     st.session_state.ultimo_diagnostico = resultado
+                    st.session_state.historico_chat = [
+                        {"role": "user",      "content": "Gere um diagnóstico completo do fluxo produtivo com base nos dados carregados."},
+                        {"role": "assistant", "content": resultado, "exportavel": True},
+                    ]
                 except anthropic.AuthenticationError:
                     st.error("❌ API Key inválida.")
                 except Exception as e:
@@ -638,8 +674,8 @@ if st.session_state.resumo_dados:
 
         st.divider()
 
-        st.subheader("💬 3. Perguntas Específicas")
-        st.caption("Faça perguntas sobre produtos, metas de lead time, turnos, equipamentos ou qualquer cenário específico.")
+        st.subheader("💬 3. Debate & Perguntas")
+        st.caption("Debata as sugestões do diagnóstico acima ou faça perguntas sobre produtos, metas, turnos, equipamentos ou qualquer cenário específico.")
 
         with st.expander("💡 Exemplos de perguntas"):
             st.markdown("""
@@ -655,6 +691,44 @@ if st.session_state.resumo_dados:
                 st.markdown(msg["content"])
                 if msg["role"] == "assistant" and msg.get("exportavel"):
                     botoes_export(msg["content"], prefixo="resposta_agente")
+
+        # ─── Botão "Discussão Concluída" ─────────────────────────────────────────
+        # Aparece após pelo menos uma rodada de debate além do diagnóstico inicial
+        if len(st.session_state.historico_chat) > 2:
+            st.divider()
+            if st.button("✅ Discussão Concluída — Gerar Relatório", use_container_width=True):
+                contexto_debate = f"""Histórico de produção dos últimos 90 dias (base da análise):
+
+{st.session_state.resumo_dados}
+
+---
+Histórico completo da discussão:
+
+"""
+                for msg in st.session_state.historico_chat:
+                    papel = "Equipe da fábrica" if msg["role"] == "user" else "Agente de análise"
+                    contexto_debate += f"**{papel}:**\n{msg['content']}\n\n"
+
+                with st.spinner("Consolidando aprendizados e plano de ação..."):
+                    try:
+                        relatorio = chamar_claude(
+                            SYSTEM_RELATORIO,
+                            [{"role": "user", "content": contexto_debate}],
+                            api_key
+                        )
+                        st.session_state.relatorio_debate = relatorio
+                    except anthropic.AuthenticationError:
+                        st.error("❌ API Key inválida.")
+                    except Exception as e:
+                        st.error(f"❌ Erro ao gerar relatório: {str(e)}")
+
+        if st.session_state.relatorio_debate:
+            st.divider()
+            st.subheader("📋 Relatório da Discussão")
+            st.markdown(st.session_state.relatorio_debate)
+            st.markdown("**Exportar relatório:**")
+            botoes_export(st.session_state.relatorio_debate, prefixo="relatorio_discussao")
+            st.divider()
 
         pergunta = st.chat_input("Faça sua pergunta sobre o fluxo produtivo...")
         if pergunta:
