@@ -466,10 +466,10 @@ def formatar_resumo(produtos):
         linhas.append(f"  [OK] Melhores: ordens {', '.join(o['ordem'] for o in melhores)} (desvios: {', '.join(str(round(o['desvio'],1))+'d' for o in melhores)})")
     return '\n'.join(linhas)
 
-def chamar_claude(system_prompt, messages, api_key):
+def chamar_claude(system_prompt, messages, api_key, model="claude-opus-4-6"):
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
-        model="claude-opus-4-6",
+        model=model,
         max_tokens=3000,
         system=system_prompt,
         messages=messages
@@ -738,25 +738,34 @@ Histórico completo da discussão:
             with st.chat_message("user", avatar="🧑"):
                 st.markdown(pergunta)
 
-            contexto_inicial = f"""Você tem acesso ao seguinte histórico de produção dos últimos 90 dias:
+            # Usa o diagnóstico como contexto (muito menor que os dados brutos)
+            # com fallback para os dados truncados se o diagnóstico ainda não foi gerado
+            contexto_comprimido = (
+                st.session_state.ultimo_diagnostico
+                or st.session_state.resumo_dados[:6000]
+            )
+            contexto_inicial = f"""Você é um especialista em fluxo produtivo industrial. Abaixo está a análise dos dados de produção dos últimos 90 dias:
 
-{st.session_state.resumo_dados}
+{contexto_comprimido}
 
 ---
-Responda à pergunta do usuário com base nesses dados."""
+Responda à pergunta do usuário com base nessa análise. Respeite todas as restrições mencionadas na conversa."""
+
+            # Limita o histórico às últimas 10 mensagens para controlar o uso de tokens
+            historico_recente = st.session_state.historico_chat[-10:]
 
             messages_para_claude = [
                 {"role": "user",      "content": contexto_inicial},
-                {"role": "assistant", "content": "Entendido. Tenho os dados históricos carregados e estou pronto para responder."},
+                {"role": "assistant", "content": "Entendido. Tenho a análise carregada e estou pronto para responder."},
             ]
-            for msg in st.session_state.historico_chat:
+            for msg in historico_recente:
                 messages_para_claude.append({"role": msg["role"], "content": msg["content"]})
             messages_para_claude.append({"role": "user", "content": pergunta})
 
             with st.chat_message("assistant", avatar="🤖"):
                 with st.spinner("Analisando..."):
                     try:
-                        resposta = chamar_claude(SYSTEM_ESPECIFICO, messages_para_claude, api_key)
+                        resposta = chamar_claude(SYSTEM_ESPECIFICO, messages_para_claude, api_key, model="claude-sonnet-4-6")
                         st.markdown(resposta)
                         botoes_export(resposta, prefixo="resposta_agente", key_suffix="current")
                         st.session_state.historico_chat.append({"role": "user",      "content": pergunta})
