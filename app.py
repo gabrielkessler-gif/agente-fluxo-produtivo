@@ -107,6 +107,8 @@ Seja direto, use os dados disponíveis e cite números reais do histórico."""
 
 SYSTEM_RELATORIO = """Você é um especialista em otimização de fluxo produtivo. Você recebe o histórico completo de uma discussão técnica entre o agente de análise e a equipe da fábrica.
 
+REGRA ABSOLUTA: Antes de escrever qualquer coisa, identifique todas as restrições, limitações e condições estabelecidas pela equipe ao longo da discussão (ex: "não podemos fazer turnos adicionais", "o equipamento X está indisponível", "o orçamento é limitado"). Essas restrições são INEGOCIÁVEIS e devem ser rigorosamente respeitadas em todo o relatório — especialmente no Plano de Ação. Jamais inclua ações que violem restrições explicitamente declaradas pela equipe.
+
 Sua tarefa é consolidar essa discussão em um relatório executivo profissional, estruturado nas seguintes seções:
 
 ## Contexto da Análise
@@ -548,14 +550,15 @@ def gerar_pdf(texto, titulo="Diagnostico de Fluxo Produtivo"):
 
     return bytes(pdf.output())
 
-def botoes_export(texto, prefixo="diagnostico"):
+def botoes_export(texto, prefixo="diagnostico", key_suffix=""):
     try:
         st.download_button(
             label="📄 Baixar PDF",
             data=gerar_pdf(texto),
             file_name=f"{prefixo}.pdf",
             mime="application/pdf",
-            use_container_width=True
+            use_container_width=True,
+            key=f"dl_{prefixo}_{key_suffix}"
         )
     except Exception as e:
         st.error(f"Erro ao gerar PDF: {e}")
@@ -670,7 +673,7 @@ if st.session_state.resumo_dados:
         if st.session_state.ultimo_diagnostico:
             st.markdown(st.session_state.ultimo_diagnostico)
             st.markdown("**Exportar diagnóstico:**")
-            botoes_export(st.session_state.ultimo_diagnostico, prefixo="diagnostico_fluxo")
+            botoes_export(st.session_state.ultimo_diagnostico, prefixo="diagnostico_fluxo", key_suffix="diag")
 
         st.divider()
 
@@ -686,11 +689,11 @@ if st.session_state.resumo_dados:
 - *Compare o desempenho do MN41-12 e MN41-68. Qual está com mais ineficiências?*
             """)
 
-        for msg in st.session_state.historico_chat:
+        for i, msg in enumerate(st.session_state.historico_chat):
             with st.chat_message(msg["role"], avatar="🧑" if msg["role"] == "user" else "🤖"):
                 st.markdown(msg["content"])
                 if msg["role"] == "assistant" and msg.get("exportavel"):
-                    botoes_export(msg["content"], prefixo="resposta_agente")
+                    botoes_export(msg["content"], prefixo="resposta_agente", key_suffix=str(i))
 
         # ─── Botão "Discussão Concluída" ─────────────────────────────────────────
         # Aparece após pelo menos uma rodada de debate além do diagnóstico inicial
@@ -727,7 +730,7 @@ Histórico completo da discussão:
             st.subheader("📋 Relatório da Discussão")
             st.markdown(st.session_state.relatorio_debate)
             st.markdown("**Exportar relatório:**")
-            botoes_export(st.session_state.relatorio_debate, prefixo="relatorio_discussao")
+            botoes_export(st.session_state.relatorio_debate, prefixo="relatorio_discussao", key_suffix="rel")
             st.divider()
 
         pergunta = st.chat_input("Faça sua pergunta sobre o fluxo produtivo...")
@@ -755,7 +758,7 @@ Responda à pergunta do usuário com base nesses dados."""
                     try:
                         resposta = chamar_claude(SYSTEM_ESPECIFICO, messages_para_claude, api_key)
                         st.markdown(resposta)
-                        botoes_export(resposta, prefixo="resposta_agente")
+                        botoes_export(resposta, prefixo="resposta_agente", key_suffix="current")
                         st.session_state.historico_chat.append({"role": "user",      "content": pergunta})
                         st.session_state.historico_chat.append({"role": "assistant", "content": resposta, "exportavel": True})
                     except anthropic.AuthenticationError:
